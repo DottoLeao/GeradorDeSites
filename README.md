@@ -1,36 +1,95 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Gerador de Sites — Micro-SaaS Multi-Tenant
 
-## Getting Started
+Plataforma para criar sites de negócios locais a partir de links do Google Maps, com dashboard de edição para clientes.
 
-First, run the development server:
+## Stack
+
+- **Next.js 16** (App Router, TypeScript)
+- **Supabase** (Postgres + RLS, Auth, Storage)
+- **Google Places API** (extração de dados)
+- **OpenAI** (geração de conteúdo estruturado via Zod)
+- **Vercel** (deploy + multi-tenant por subdomínio)
+
+## Setup
+
+### 1. Instalar dependências
+
+```bash
+npm install
+```
+
+### 2. Configurar variáveis de ambiente
+
+```bash
+cp .env.example .env.local
+```
+
+Preencha as chaves do Supabase, Google Places e (opcionalmente) OpenAI.
+
+### 3. Aplicar migrations no Supabase
+
+```bash
+# Via Supabase CLI
+supabase db push
+
+# Ou execute manualmente o SQL em:
+# supabase/migrations/20250612130000_initial_schema.sql
+```
+
+### 4. Criar usuário admin
+
+Após criar sua conta via Magic Link, promova para admin no SQL Editor do Supabase:
+
+```sql
+UPDATE profiles SET role = 'admin' WHERE email = 'seu@email.com';
+```
+
+### 5. Rodar localmente
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Acesse `http://localhost:3000` para o painel admin.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Sites de clientes ficam em `http://{slug}.localhost:3000`.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Estrutura
 
-## Learn More
+```
+src/
+├── app/
+│   ├── admin/          # Painel do desenvolvedor
+│   ├── dashboard/      # Dashboard do cliente
+│   ├── sites/[slug]/   # Sites públicos (ISR)
+│   └── api/            # API routes
+├── components/
+│   ├── admin/          # Criador de sites, listagem
+│   ├── dashboard/      # Editor de conteúdo, upload
+│   └── ui/             # Componentes base
+├── lib/
+│   ├── ai/             # Geração de conteúdo com IA
+│   ├── schemas/        # Schemas Zod por template
+│   ├── services/       # Lógica de negócio
+│   └── supabase/       # Clients Supabase
+├── templates/
+│   ├── universal/      # Template genérico
+│   └── restaurant/     # Template restaurante
+└── middleware.ts       # Multi-tenant routing
+```
 
-To learn more about Next.js, take a look at the following resources:
+## Fluxo de criação
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+1. Admin cola link do Google Maps + escolhe template
+2. Pipeline extrai dados via Places API
+3. IA gera conteúdo + SEO (validado por Zod)
+4. Site provisionado no banco com RLS
+5. Magic Link gerado para onboarding do cliente
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Se a extração falhar, um formulário manual permite criar o site mesmo assim.
 
-## Deploy on Vercel
+## Fases futuras
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- **Fase 3**: Stripe (billing + inadimplência)
+- **Fase 4**: Domínios customizados (Vercel Domains API)
+- **Fase 5**: Monitoramento + limpeza de churn
