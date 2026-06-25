@@ -40,6 +40,7 @@ interface ProspectCardProps {
   prospect: Prospect;
   searchCenter?: { lat: number; lng: number } | null;
   isSelected?: boolean;
+  isVerifyingWebsite?: boolean;
   onSelect?: () => void;
 }
 
@@ -47,6 +48,7 @@ export function ProspectCard({
   prospect,
   searchCenter,
   isSelected,
+  isVerifyingWebsite,
   onSelect,
 }: ProspectCardProps) {
   const [expanded, setExpanded] = useState(false);
@@ -154,8 +156,14 @@ export function ProspectCard({
             <Badge variant={TIER_BADGE_VARIANT[prospect.tier]}>
               {TIER_LABELS[prospect.tier]} · {prospect.heatScore}
             </Badge>
-            {!prospect.website && (
+            {!prospect.website && isVerifyingWebsite && (
+              <Badge variant="warning">Verificando site…</Badge>
+            )}
+            {!prospect.website && !isVerifyingWebsite && (
               <Badge variant="error">Sem site</Badge>
+            )}
+            {prospect.website && prospect.websiteSource === "chain" && (
+              <Badge variant="warning">Site da rede</Badge>
             )}
           </div>
 
@@ -218,7 +226,9 @@ export function ProspectCard({
                   className="text-blue-600 hover:underline"
                   onClick={(e) => e.stopPropagation()}
                 >
-                  Site existente
+                  {prospect.websiteSource === "chain"
+                    ? "Site da rede"
+                    : "Site existente"}
                 </a>
               </p>
             )}

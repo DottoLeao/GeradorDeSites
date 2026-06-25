@@ -7,6 +7,7 @@ const searchSchema = z.object({
   lat: z.number().min(-90).max(90),
   lng: z.number().min(-180).max(180),
   radiusMeters: z.number().min(1000).max(50000),
+  enrich: z.boolean().optional(),
 });
 
 export async function POST(request: Request) {

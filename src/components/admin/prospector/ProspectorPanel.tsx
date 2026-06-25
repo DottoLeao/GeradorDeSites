@@ -21,6 +21,22 @@ const ProspectMap = dynamic(
 
 const DEFAULT_RADIUS_KM = 15;
 
+type SearchPhase = "idle" | "searching" | "enriching" | "done";
+
+function formatSeconds(ms: number): string {
+  const seconds = Math.max(1, Math.round(ms / 1000));
+  return `${seconds}s`;
+}
+
+function mergeProspectUpdate(
+  prospects: Prospect[],
+  updated: Prospect
+): Prospect[] {
+  return [...prospects]
+    .map((p) => (p.placeId === updated.placeId ? updated : p))
+    .sort((a, b) => b.heatScore - a.heatScore);
+}
+
 export function ProspectorPanel() {
   const [location, setLocation] = useState<{ lat: number; lng: number } | null>(
     null
@@ -30,11 +46,109 @@ export function ProspectorPanel() {
   const [showManualLocation, setShowManualLocation] = useState(false);
   const [radiusKm, setRadiusKm] = useState(DEFAULT_RADIUS_KM);
   const [prospects, setProspects] = useState<Prospect[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [searchPhase, setSearchPhase] = useState<SearchPhase>("idle");
+  const [enrichProgress, setEnrichProgress] = useState({ done: 0, total: 0 });
+  const [enrichStartedAt, setEnrichStartedAt] = useState<number | null>(null);
   const [geoLoading, setGeoLoading] = useState(true);
   const [selectedPlaceId, setSelectedPlaceId] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const cardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+
+  const isSearching = searchPhase === "searching";
+  const isEnriching = searchPhase === "enriching";
+  const isBusy = isSearching || isEnriching;
+
+  const enrichEtaMs =
+    isEnriching &&
+    enrichProgress.done > 0 &&
+    enrichStartedAt !== null
+      ? (Date.now() - enrichStartedAt) /
+        enrichProgress.done *
+        (enrichProgress.total - enrichProgress.done)
+      : null;
+
+  const enrichProspectsStream = useCallback(
+    async (baseProspects: Prospect[], signal: AbortSignal) => {
+      setSearchPhase("enriching");
+      setEnrichProgress({ done: 0, total: 0 });
+      setEnrichStartedAt(Date.now());
+
+      try {
+        const response = await fetch("/api/prospects/enrich", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ prospects: baseProspects }),
+          signal,
+        });
+
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          toast.error(data.error ?? "Erro ao verificar sites dos leads");
+          setSearchPhase("done");
+          return;
+        }
+
+        const reader = response.body?.getReader();
+        if (!reader) {
+          toast.error("Resposta inválida ao verificar sites");
+          setSearchPhase("done");
+          return;
+        }
+
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (!line.trim()) continue;
+
+            const event = JSON.parse(line) as {
+              type: string;
+              total?: number;
+              done?: number;
+              prospect?: Prospect;
+              prospects?: Prospect[];
+              error?: string;
+            };
+
+            if (event.type === "start" && event.total !== undefined) {
+              setEnrichProgress({ done: 0, total: event.total });
+            } else if (
+              event.type === "progress" &&
+              event.prospect &&
+              event.done !== undefined &&
+              event.total !== undefined
+            ) {
+              setEnrichProgress({ done: event.done, total: event.total });
+              setProspects((prev) => mergeProspectUpdate(prev, event.prospect!));
+            } else if (event.type === "complete" && event.prospects) {
+              setProspects(event.prospects);
+            } else if (event.type === "error") {
+              toast.error(event.error ?? "Erro ao verificar sites dos leads");
+            }
+          }
+        }
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          return;
+        }
+        toast.error("Erro de conexão ao verificar sites dos leads");
+      } finally {
+        if (!signal.aborted) {
+          setSearchPhase("done");
+          setEnrichStartedAt(null);
+        }
+      }
+    },
+    []
+  );
 
   const searchProspects = useCallback(
     async (lat: number, lng: number, radius: number) => {
@@ -42,7 +156,10 @@ export function ProspectorPanel() {
       const controller = new AbortController();
       abortRef.current = controller;
 
-      setLoading(true);
+      setSearchPhase("searching");
+      setEnrichProgress({ done: 0, total: 0 });
+      setEnrichStartedAt(null);
+
       try {
         const response = await fetch("/api/prospects/search", {
           method: "POST",
@@ -51,6 +168,7 @@ export function ProspectorPanel() {
             lat,
             lng,
             radiusMeters: radius * 1000,
+            enrich: false,
           }),
           signal: controller.signal,
         });
@@ -60,26 +178,30 @@ export function ProspectorPanel() {
         if (!response.ok) {
           toast.error(data.error ?? "Erro ao buscar estabelecimentos");
           setProspects([]);
+          setSearchPhase("idle");
           return;
         }
 
-        setProspects(data.prospects ?? []);
-        if ((data.prospects ?? []).length === 0) {
+        const found: Prospect[] = data.prospects ?? [];
+        setProspects(found);
+
+        if (found.length === 0) {
           toast.info("Nenhum estabelecimento encontrado neste raio");
+          setSearchPhase("done");
+          return;
         }
+
+        await enrichProspectsStream(found, controller.signal);
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") {
           return;
         }
         toast.error("Erro de conexão ao buscar estabelecimentos");
         setProspects([]);
-      } finally {
-        if (!controller.signal.aborted) {
-          setLoading(false);
-        }
+        setSearchPhase("idle");
       }
     },
-    []
+    [enrichProspectsStream]
   );
 
   useEffect(() => {
@@ -148,6 +270,11 @@ export function ProspectorPanel() {
     ? [location.lat, location.lng]
     : null;
 
+  const progressPercent =
+    enrichProgress.total > 0
+      ? Math.round((enrichProgress.done / enrichProgress.total) * 100)
+      : 0;
+
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-end gap-4">
@@ -162,7 +289,7 @@ export function ProspectorPanel() {
             value={radiusKm}
             onChange={(e) => setRadiusKm(Number(e.target.value))}
             className="mt-2 w-full accent-blue-600"
-            disabled={!location}
+            disabled={!location || isBusy}
           />
         </div>
 
@@ -175,9 +302,13 @@ export function ProspectorPanel() {
         <Button
           size="sm"
           onClick={handleSearchClick}
-          disabled={!location || loading}
+          disabled={!location || isBusy}
         >
-          {loading ? "Buscando..." : "Buscar estabelecimentos"}
+          {isSearching
+            ? "Buscando..."
+            : isEnriching
+              ? "Verificando sites..."
+              : "Buscar estabelecimentos"}
         </Button>
 
         <Button
@@ -188,6 +319,30 @@ export function ProspectorPanel() {
           {showManualLocation ? "Ocultar coordenadas" : "Alterar localização"}
         </Button>
       </div>
+
+      {isEnriching && (
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-slate-600">
+            <span>
+              Verificando sites dos leads… classificação pode mudar
+            </span>
+            <span className="tabular-nums text-slate-500">
+              {enrichProgress.total > 0
+                ? `${enrichProgress.done}/${enrichProgress.total}`
+                : "…"}
+              {enrichEtaMs !== null && enrichEtaMs > 0
+                ? ` · ~${formatSeconds(enrichEtaMs)} restantes`
+                : ""}
+            </span>
+          </div>
+          <div className="h-2 overflow-hidden rounded-full bg-slate-200">
+            <div
+              className="h-full rounded-full bg-blue-600 transition-[width] duration-300"
+              style={{ width: `${progressPercent}%` }}
+            />
+          </div>
+        </div>
+      )}
 
       {showManualLocation && (
         <Card className="p-4">
@@ -244,9 +399,20 @@ export function ProspectorPanel() {
               selectedPlaceId={selectedPlaceId}
               onSelectProspect={handleSelectProspect}
             />
-            {loading && (
+            {isSearching && (
               <div className="absolute inset-0 flex items-center justify-center bg-white/60 text-sm font-medium text-slate-700">
                 Buscando estabelecimentos...
+              </div>
+            )}
+            {isEnriching && !isSearching && (
+              <div className="absolute inset-x-0 bottom-0 bg-white/80 px-4 py-2 text-center text-sm font-medium text-slate-700">
+                Verificando sites…{" "}
+                {enrichProgress.total > 0
+                  ? `${enrichProgress.done}/${enrichProgress.total}`
+                  : ""}
+                {enrichEtaMs !== null && enrichEtaMs > 0
+                  ? ` · ~${formatSeconds(enrichEtaMs)}`
+                  : ""}
               </div>
             )}
           </div>
@@ -262,7 +428,7 @@ export function ProspectorPanel() {
             </div>
 
             <div className="max-h-[400px] space-y-3 overflow-y-auto pr-1">
-              {prospects.length === 0 && !loading ? (
+              {prospects.length === 0 && !isBusy ? (
                 <p className="text-sm text-slate-500">
                   Nenhum estabelecimento no raio selecionado.
                 </p>
@@ -279,6 +445,11 @@ export function ProspectorPanel() {
                       prospect={prospect}
                       searchCenter={location}
                       isSelected={selectedPlaceId === prospect.placeId}
+                      isVerifyingWebsite={
+                        isEnriching &&
+                        !prospect.website &&
+                        !prospect.placeId.startsWith("osm:")
+                      }
                       onSelect={() => setSelectedPlaceId(prospect.placeId)}
                     />
                   </div>

@@ -1,5 +1,7 @@
 export type ProspectTier = "hot" | "warm" | "cold";
 
+export type WebsiteSource = "api" | "chain";
+
 export interface Prospect {
   placeId: string;
   name: string;
@@ -9,6 +11,7 @@ export interface Prospect {
   rating: number | null;
   reviewCount: number | null;
   website: string | null;
+  websiteSource?: WebsiteSource;
   phone: string | null;
   mapsUrl: string;
   types: string[];

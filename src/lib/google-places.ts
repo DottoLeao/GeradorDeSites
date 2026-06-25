@@ -1,6 +1,13 @@
 import type { Prospect, ProspectTier } from "@/lib/types/prospect";
 import { scoreProspect } from "@/lib/prospect-score";
+import {
+  normalizeWebsiteUrl,
+  resolveProspectWebsite,
+  runWithConcurrency,
+  type WebsiteSource,
+} from "@/lib/website-resolver";
 
+export { normalizeWebsiteUrl } from "@/lib/website-resolver";
 export type { Prospect, ProspectTier };
 
 export interface PlaceDetails {
@@ -220,6 +227,7 @@ const PROSPECT_INCLUDED_TYPES = [
   "cafe",
   "bar",
   "bakery",
+  "gas_station",
   "beauty_salon",
   "hair_care",
   "dentist",
@@ -329,7 +337,7 @@ function mapNewApiPlaceToProspect(place: PlacesNewNearbyPlace): Prospect | null 
     return null;
   }
 
-  const website = place.websiteUri ?? null;
+  const website = normalizeWebsiteUrl(place.websiteUri);
   const openingHours = place.regularOpeningHours?.weekdayDescriptions ?? null;
   const { city, state } = parseNewApiAddressComponents(place.addressComponents);
   const { heatScore, tier } = scoreProspect({
@@ -427,6 +435,7 @@ const LEGACY_NEARBY_TYPES = [
   "pharmacy",
   "lawyer",
   "spa",
+  "gas_station",
 ] as const;
 
 interface LegacyNearbyResult {
@@ -491,6 +500,95 @@ async function legacyNearbySearch(
   return data.results ?? [];
 }
 
+function rescoreProspect(
+  prospect: Prospect,
+  website: string | null,
+  websiteSource?: WebsiteSource
+): Prospect {
+  const { heatScore, tier } = scoreProspect({
+    rating: prospect.rating,
+    reviewCount: prospect.reviewCount,
+    website,
+    phone: prospect.phone,
+    openingHours: prospect.openingHours ?? null,
+  });
+
+  return {
+    ...prospect,
+    website,
+    websiteSource: website ? websiteSource : undefined,
+    heatScore,
+    tier,
+  };
+}
+
+const ENRICH_CONCURRENCY = 8;
+
+export interface EnrichProspectWebsitesOptions {
+  onProgress?: (done: number, total: number, prospect: Prospect) => void;
+}
+
+export async function enrichProspectWebsites(
+  apiKey: string,
+  prospects: Prospect[],
+  options?: EnrichProspectWebsitesOptions
+): Promise<Prospect[]> {
+  const needsEnrich = prospects.filter(
+    (p) => !p.website && !p.placeId.startsWith("osm:")
+  );
+
+  if (needsEnrich.length === 0) return prospects;
+
+  const resolutionByPlaceId = new Map<
+    string,
+    { website: string | null; source?: WebsiteSource }
+  >();
+  let done = 0;
+
+  await runWithConcurrency(
+    needsEnrich,
+    ENRICH_CONCURRENCY,
+    async (prospect) => {
+      const resolution = await resolveProspectWebsite(apiKey, prospect);
+
+      if (!resolution.website && process.env.NODE_ENV === "development") {
+        console.warn(
+          `[prospector] website não encontrado para ${prospect.placeId} (${prospect.name})`
+        );
+      }
+
+      resolutionByPlaceId.set(prospect.placeId, {
+        website: resolution.website,
+        source: resolution.source,
+      });
+
+      done += 1;
+      const website = resolution.website;
+      const websiteSource = website ? resolution.source : undefined;
+      const updated =
+        website === prospect.website && websiteSource === prospect.websiteSource
+          ? prospect
+          : rescoreProspect(prospect, website, websiteSource);
+
+      options?.onProgress?.(done, needsEnrich.length, updated);
+    }
+  );
+
+  return prospects.map((prospect) => {
+    const resolution = resolutionByPlaceId.get(prospect.placeId);
+    const website = prospect.website ?? resolution?.website ?? null;
+    const websiteSource = prospect.website
+      ? prospect.websiteSource
+      : resolution?.source;
+
+    if (website === prospect.website && websiteSource === prospect.websiteSource) {
+      return prospect;
+    }
+
+    return rescoreProspect(prospect, website, websiteSource);
+  });
+}
+
 async function legacyPlaceDetails(
   apiKey: string,
   placeId: string
@@ -547,7 +645,7 @@ async function searchNearbyProspectsLegacy(
   const prospects = await Promise.all(
     candidates.map(async (place) => {
       const details = await legacyPlaceDetails(apiKey, place.place_id);
-      const website = details?.website ?? null;
+      const website = normalizeWebsiteUrl(details?.website);
       const openingHours = details?.opening_hours?.weekday_text ?? null;
       const { city, state } = parseAddressComponents(
         details?.address_components ?? []
@@ -591,21 +689,34 @@ async function searchNearbyProspectsLegacy(
   return prospects;
 }
 
-export async function searchNearbyProspects(params: {
-  lat: number;
-  lng: number;
-  radiusMeters: number;
-}): Promise<Prospect[]> {
+export async function searchNearbyProspects(
+  params: {
+    lat: number;
+    lng: number;
+    radiusMeters: number;
+  },
+  options?: { enrich?: boolean }
+): Promise<Prospect[]> {
   const apiKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!apiKey) {
     throw new Error("GOOGLE_PLACES_API_KEY não configurada");
   }
 
+  const shouldEnrich = options?.enrich !== false;
+
   const fromNewApi = await searchNearbyProspectsNew(apiKey, params);
   if (fromNewApi !== null) {
-    fromNewApi.sort((a, b) => b.heatScore - a.heatScore);
-    return fromNewApi;
+    const results = shouldEnrich
+      ? await enrichProspectWebsites(apiKey, fromNewApi)
+      : fromNewApi;
+    results.sort((a, b) => b.heatScore - a.heatScore);
+    return results;
   }
 
-  return searchNearbyProspectsLegacy(apiKey, params);
+  const fromLegacy = await searchNearbyProspectsLegacy(apiKey, params);
+  const results = shouldEnrich
+    ? await enrichProspectWebsites(apiKey, fromLegacy)
+    : fromLegacy;
+  results.sort((a, b) => b.heatScore - a.heatScore);
+  return results;
 }

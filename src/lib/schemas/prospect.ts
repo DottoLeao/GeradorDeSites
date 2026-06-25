@@ -9,6 +9,7 @@ export const prospectSchema = z.object({
   rating: z.number().nullable(),
   reviewCount: z.number().nullable(),
   website: z.string().nullable(),
+  websiteSource: z.enum(["api", "chain"]).optional(),
   phone: z.string().nullable(),
   mapsUrl: z.string().url(),
   types: z.array(z.string()),
